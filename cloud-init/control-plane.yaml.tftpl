@@ -1,0 +1,180 @@
+#cloud-config
+package_update: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - containerd
+  - curl
+  - gnupg
+  - jq
+  - lsb-release
+
+write_files:
+  - path: /etc/modules-load.d/kubernetes.conf
+    permissions: "0644"
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/99-kubernetes-cri.conf
+    permissions: "0644"
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+
+  - path: /opt/kubernetes/hello-world.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: hello-world-html
+      data:
+        index.html: |
+          <!doctype html>
+          <html lang="en">
+            <head><meta charset="utf-8"><title>Azure kubeadm Lab</title></head>
+            <body style="font-family:Arial;text-align:center;margin-top:80px">
+              <h1>Hello World from multi-node Kubernetes!</h1>
+              <p>Terraform -> cloud-init -> kubeadm -> containerd -> Kubernetes</p>
+            </body>
+          </html>
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: hello-world
+      spec:
+        replicas: 2
+        selector:
+          matchLabels:
+            app: hello-world
+        template:
+          metadata:
+            labels:
+              app: hello-world
+          spec:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app: hello-world
+                    topologyKey: kubernetes.io/hostname
+            containers:
+              - name: nginx
+                image: nginx:alpine
+                ports:
+                  - containerPort: 80
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                  limits:
+                    cpu: 250m
+                    memory: 128Mi
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 3
+                  periodSeconds: 5
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                volumeMounts:
+                  - name: html
+                    mountPath: /usr/share/nginx/html/index.html
+                    subPath: index.html
+            volumes:
+              - name: html
+                configMap:
+                  name: hello-world-html
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: hello-world
+      spec:
+        type: NodePort
+        selector:
+          app: hello-world
+        ports:
+          - name: http
+            port: 80
+            targetPort: 80
+            nodePort: 30080
+
+  - path: /usr/local/sbin/setup-control-plane.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      swapoff -a
+      sed -i '/ swap / s/^/#/' /etc/fstab
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      mkdir -p /etc/containerd
+      containerd config default > /etc/containerd/config.toml
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      systemctl enable --now containerd
+      systemctl restart containerd
+
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/${kubernetes_minor_version}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      chmod 0644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${kubernetes_minor_version}/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+
+      curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+      chmod 0644 /etc/apt/keyrings/microsoft.gpg
+      AZ_DIST=$(lsb_release -cs)
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $AZ_DIST main" > /etc/apt/sources.list.d/azure-cli.list
+
+      apt-get update
+      apt-get install -y kubelet kubeadm kubectl azure-cli
+      apt-mark hold kubelet kubeadm kubectl
+      systemctl enable kubelet
+
+      if [ ! -f /etc/kubernetes/admin.conf ]; then
+        kubeadm init \
+          --node-name k8s-control \
+          --apiserver-advertise-address=${control_plane_ip} \
+          --apiserver-cert-extra-sans=${public_ip} \
+          --pod-network-cidr=10.244.0.0/16 \
+          --cri-socket=unix:///run/containerd/containerd.sock
+      fi
+
+      install -d -m 0700 -o ${admin_username} -g ${admin_username} /home/${admin_username}/.kube
+      install -m 0600 -o ${admin_username} -g ${admin_username} /etc/kubernetes/admin.conf /home/${admin_username}/.kube/config
+
+      sudo -iu ${admin_username} kubectl apply -f https://github.com/flannel-io/flannel/releases/download/v0.28.9/kube-flannel.yml
+      sudo -iu ${admin_username} kubectl apply -f /opt/kubernetes/hello-world.yaml
+
+      az login --identity --allow-no-subscriptions >/dev/null
+      JOIN_COMMAND=$(kubeadm token create --ttl 1h --print-join-command)
+      EXPIRES=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')
+
+      for attempt in $(seq 1 120); do
+        if az keyvault secret set --vault-name ${key_vault_name} --name kubeadm-join --value "$JOIN_COMMAND" --expires "$EXPIRES" --only-show-errors >/dev/null 2>&1; then
+          echo "Published short-lived kubeadm join command to Key Vault"
+          exit 0
+        fi
+        echo "Waiting for Key Vault RBAC propagation: attempt $attempt/120"
+        sleep 10
+      done
+
+      echo "Unable to publish kubeadm join command to Key Vault" >&2
+      exit 1
+
+runcmd:
+  - [/usr/local/sbin/setup-control-plane.sh]
+
+final_message: "Control plane cloud-init finished after $UPTIME seconds"
+
